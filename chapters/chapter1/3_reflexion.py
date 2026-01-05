@@ -1,131 +1,146 @@
+import datetime
+import getpass
 import os
-from dotenv import load_dotenv
+import json
+from typing import Annotated, List, Union
+from typing_extensions import TypedDict
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_community.utilities.tavily_search import TavilySearchAPIWrapper
+from langchain_core.messages import HumanMessage, ToolMessage, BaseMessage, AIMessage
+from langchain_core.output_parsers.openai_tools import PydanticToolsParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import StructuredTool
+from langgraph.graph import END, StateGraph, START
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from pydantic import BaseModel, Field, ValidationError
+from dotenv import load_dotenv
 
-# --- Configuration ---
-# Load environment variables from .env file (for GOOGLE_API_KEY)
 load_dotenv()
+# --- Setup Environment ---
+def _set_if_undefined(var: str) -> None:
+    if not os.environ.get(var):
+        os.environ[var] = getpass.getpass(f"Please enter {var}: ")
 
-if not os.getenv("GOOGLE_API_KEY"):
-    raise ValueError(
-        "GOOGLE_API_KEY not found in .env file. Please add it."
+_set_if_undefined("GOOGLE_API_KEY")
+_set_if_undefined("TAVILY_API_KEY")
+
+# --- Define LLM and Tools ---
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0)
+
+search = TavilySearchAPIWrapper()
+tavily_tool = TavilySearchResults(api_wrapper=search, max_results=5)
+
+# --- Define Schemas ---
+class Reflection(BaseModel):
+    missing: str = Field(description="Critique of what is missing.")
+    superfluous: str = Field(description="Critique of what is superfluous")
+
+class AnswerQuestion(BaseModel):
+    """Answer the question. Provide an answer, reflection, and then follow up with search queries."""
+    answer: str = Field(description="~250 word detailed answer to the question.")
+    reflection: Reflection = Field(description="Your reflection on the initial answer.")
+    search_queries: list[str] = Field(
+        description="1-3 search queries for researching improvements to address the critique."
     )
 
-# Initialize the Chat LLM (Gemini)
-# Lower temperature for deterministic reasoning
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    temperature=0.1,
-)
+class ReviseAnswer(AnswerQuestion):
+    """Revise your original answer. Provide an answer, reflection, citations, and search queries."""
+    references: list[str] = Field(
+        description="Citations motivating your updated answer."
+    )
 
-def run_reflection_loop():
-    """
-    Demonstrates a multi-step AI reflection loop to progressively
-    improve a Python function.
-    """
+# --- Actor Logic with Retries ---
+class ResponderWithRetries:
+    def __init__(self, runnable, validator):
+        self.runnable = runnable
+        self.validator = validator
 
-    # --- The Core Task ---
-    task_prompt = """
-Your task is to create a Python function named `calculate_factorial`.
-
-This function should:
-1. Accept a single integer `n` as input.
-2. Calculate its factorial (n!).
-3. Include a clear docstring explaining what the function does.
-4. Handle edge cases: The factorial of 0 is 1.
-5. Handle invalid input: Raise a ValueError if the input is a negative number.
-"""
-
-    # --- Reflection Loop ---
-    max_iterations = 3
-    current_code = ""
-
-    # Conversation history for iterative refinement
-    message_history = [
-        HumanMessage(content=task_prompt)
-    ]
-
-    for i in range(max_iterations):
-        print(
-            "\n" + "=" * 25 +
-            f" REFLECTION LOOP: ITERATION {i + 1} " +
-            "=" * 25
-        )
-
-        # --- 1. GENERATE / REFINE STAGE ---
-        if i == 0:
-            print("\n>>> STAGE 1: GENERATING initial code...")
-            response = llm.invoke(message_history)
-            current_code = response.content
-        else:
-            print("\n>>> STAGE 1: REFINING code based on previous critique...")
-            message_history.append(
-                HumanMessage(
-                    content="Please refine the code using the critiques provided."
+    def respond(self, state: dict):
+        messages = state["messages"]
+        for attempt in range(3):
+            response = self.runnable.invoke({"messages": messages})
+            try:
+                # Gemini tool calling validation
+                self.validator.invoke(response)
+                return {"messages": [response]}
+            except Exception as e:
+                # Add error feedback to the message history for the next retry
+                feedback = ToolMessage(
+                    content=f"Validation Error: {repr(e)}. Please fix the tool call arguments.",
+                    tool_call_id=response.tool_calls[0]["id"] if response.tool_calls else "none"
                 )
-            )
-            response = llm.invoke(message_history)
-            current_code = response.content
+                messages = messages + [response, feedback]
+        return {"messages": [response]}
 
-        print(f"\n--- Generated Code (v{i + 1}) ---\n")
-        print(current_code)
+# --- Prompts and Chains ---
+actor_prompt_template = ChatPromptTemplate.from_messages([
+    ("system", "You are an expert researcher. Current time: {time}\n"
+               "1. {first_instruction}\n"
+               "2. Reflect and critique your answer. Be severe to maximize improvement.\n"
+               "3. Recommend search queries to research information and improve your answer."),
+    MessagesPlaceholder(variable_name="messages"),
+    ("user", "\n\n<system>Reflect on the user's original question and the actions taken thus far. "
+             "Respond using the {function_name} function.</system>"),
+]).partial(time=lambda: datetime.datetime.now().isoformat())
 
-        # Add generated code to history
-        message_history.append(response)
+initial_answer_chain = actor_prompt_template.partial(
+    first_instruction="Provide a detailed ~250 word answer.",
+    function_name=AnswerQuestion.__name__,
+) | llm.bind_tools(tools=[AnswerQuestion])
 
-        # --- 2. REFLECT STAGE ---
-        print("\n>>> STAGE 2: REFLECTING on the generated code...")
+revision_instructions = """Revise your previous answer using the new information.
+- Use previous critique to add important info.
+- MUST include numerical citations [1], [2], etc.
+- Add a 'References' section at the bottom.
+- Ensure the answer (excluding references) is under 250 words."""
 
-        reflector_prompt = [
-            SystemMessage(
-                content="""
-You are a senior software engineer and an expert in Python.
-Your role is to perform a meticulous code review.
+revision_chain = actor_prompt_template.partial(
+    first_instruction=revision_instructions,
+    function_name=ReviseAnswer.__name__,
+) | llm.bind_tools(tools=[ReviseAnswer])
 
-Critically evaluate the provided Python code based on the original task.
-Look for bugs, style issues, missing edge cases, and areas for improvement.
+# --- Nodes ---
+first_responder = ResponderWithRetries(runnable=initial_answer_chain, validator=PydanticToolsParser(tools=[AnswerQuestion]))
+revisor = ResponderWithRetries(runnable=revision_chain, validator=PydanticToolsParser(tools=[ReviseAnswer]))
 
-If the code is perfect and meets all requirements,
-respond with the single phrase: CODE_IS_PERFECT
+def run_queries(search_queries: list[str], **kwargs):
+    """Execute search queries using Tavily search tool."""
+    return tavily_tool.batch([{"query": query} for query in search_queries])
 
-Otherwise, provide a bulleted list of critiques.
-"""
-            ),
-            HumanMessage(
-                content=(
-                    f"Original Task:\n{task_prompt}\n\n"
-                    f"Code to Review:\n{current_code}"
-                )
-            )
-        ]
+tool_node = ToolNode([
+    StructuredTool.from_function(run_queries, name=AnswerQuestion.__name__),
+    StructuredTool.from_function(run_queries, name=ReviseAnswer.__name__),
+])
 
-        critique_response = llm.invoke(reflector_prompt)
-        critique = critique_response.content
+# --- Graph Construction ---
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
 
-        # --- 3. STOPPING CONDITION ---
-        if "CODE_IS_PERFECT" in critique:
-            print(
-                "\n--- Critique ---\n"
-                "No further critiques found. The code is satisfactory."
-            )
-            break
+def event_loop(state: State):
+    # Logic to stop after specific number of AI/Tool loops
+    count = sum(1 for m in state["messages"] if isinstance(m, AIMessage) and m.tool_calls)
+    if count > 3: # MAX_ITERATIONS
+        return END
+    return "execute_tools"
 
-        print("\n--- Critique ---\n")
-        print(critique)
+builder = StateGraph(State)
+builder.add_node("draft", first_responder.respond)
+builder.add_node("execute_tools", tool_node)
+builder.add_node("revise", revisor.respond)
 
-        # Add critique to history for next refinement loop
-        message_history.append(
-            HumanMessage(
-                content=f"Critique of the previous code:\n{critique}"
-            )
-        )
+builder.add_edge(START, "draft")
+builder.add_edge("draft", "execute_tools")
+builder.add_edge("execute_tools", "revise")
+builder.add_conditional_edges("revise", event_loop, ["execute_tools", END])
 
-    print("\n" + "=" * 30 + " FINAL RESULT " + "=" * 30)
-    print("\nFinal refined code after the reflection process:\n")
-    print(current_code)
+graph = builder.compile()
 
-
+# --- Execution ---
 if __name__ == "__main__":
-    run_reflection_loop()
+    inputs = {"messages": [HumanMessage(content="How should we handle the climate crisis?")]}
+    for event in graph.stream(inputs, stream_mode="values"):
+        if "messages" in event:
+            event["messages"][-1].pretty_print()
