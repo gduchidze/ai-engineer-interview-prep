@@ -81,13 +81,13 @@ Navigate to any chapter directory and run the Python scripts:
 
 ```bash
 # Example: Run prompt chaining example
-python chapters/chapter1/1_prompt_chaining.py
+python ai_agents_patterns/chapter1/1_prompt_chaining.py
 
 # Example: Run memory management
-python chapters/chapter2/1_memory_management.py
+python ai_agents_patterns/chapter2/1_memory_management.py
 
 # Example: Run A2A communication
-python chapters/chapter3/1_a2a.py
+python ai_agents_patterns/chapter3/1_a2a.py
 ```
 
 ## 🎯 Learning Path
