@@ -14,6 +14,7 @@ def target_sum(arr, target):
 arr = [1, 2, 3, 4, 6]
 target = 6
 result = target_sum(arr, target)
+
 if result:
     print(f"Pair found at indices: {result}")
 else:
